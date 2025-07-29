@@ -1,131 +1,101 @@
 import os
 from datetime import date, timedelta
-from sqlalchemy import create_engine, func, and_
+from sqlalchemy import create_engine, and_
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import func
 from dotenv import load_dotenv
 
-# Make sure your minimal models.py includes all of these
-from models import (
-    Project, ProjectInterfaceStatus, WeeklyProgressSnapshot,
-    ProjectScheduleTask, UploadHistory, InterfaceStatusEnum
-)
+# Assuming models are in a shared 'models.py' file or defined here
+from models import Project, ProjectInterfaceStatus, WeeklyProgressSnapshot, UploadHistory, ProjectScheduleTask, InterfaceStatusEnum
 
-# --- CONFIGURATION ---
+# --- Database Connection ---
 load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL", "mysql+pymysql://root:Scramble_06!@localhost:3306/wysuppdb")
+if DATABASE_URL and DATABASE_URL.startswith("mysql://"):
+    DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable not set.")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-
-def take_weekly_snapshots():
+def take_weekly_snapshot():
     db = SessionLocal()
-    try:
-        today = date.today()
-        days_since_sunday = (today.weekday() + 1) % 7
-        last_sunday = today - timedelta(days=days_since_sunday)
+    today = date.today()
+    # Ensure snapshot is taken on a specific day, e.g., Sunday
+    if today.weekday() != 6: # 6 is Sunday
+        print("Not a snapshot day. Exiting.")
+        db.close()
+        return
 
-        print(f"Running weekly snapshot for the week ending on: {last_sunday}")
+    projects = db.query(Project).all()
+    for project in projects:
+        print(f"Processing snapshot for project: {project.project_name}...")
+        
+        # --- THIS IS THE NEW, HARMONIZED LOGIC ---
+        all_statuses = db.query(ProjectInterfaceStatus).filter(ProjectInterfaceStatus.project_id == project.id).all()
+        total_interfaces = len(all_statuses)
+        if total_interfaces == 0:
+            continue
 
-        projects = db.query(Project).all()
-        if not projects:
-            print("No projects found to snapshot.")
-            return
+        all_tasks = db.query(ProjectScheduleTask).filter(ProjectScheduleTask.project_id == project.id).all()
+        all_uploads = db.query(UploadHistory).filter(UploadHistory.project_name == project.project_name).order_by(UploadHistory.uploaded_at.asc()).all()
 
-        for project in projects:
-            print(f"Processing project: {project.project_name}...")
-
-            # --- 1. Fetch all data for the project ---
-            all_statuses = db.query(ProjectInterfaceStatus).filter(ProjectInterfaceStatus.project_id == project.id).all()
-            all_tasks = db.query(ProjectScheduleTask).filter(ProjectScheduleTask.project_id == project.id).all()
-            
-            subquery = db.query(
-                UploadHistory.interface_name,
-                func.max(UploadHistory.uploaded_at).label('max_uploaded_at')
-            ).filter(UploadHistory.project_name == project.project_name).group_by(UploadHistory.interface_name).subquery()
-            
-            latest_uploads = db.query(UploadHistory).join(
-                subquery,
-                and_(
-                    UploadHistory.interface_name == subquery.c.interface_name,
-                    UploadHistory.uploaded_at == subquery.c.max_uploaded_at
-                )
-            ).all()
-            latest_upload_map = {u.interface_name: u.status for u in latest_uploads}
-
-            total_interfaces = len(all_statuses)
-            if total_interfaces == 0:
-                print(f"Project {project.project_name} has no interfaces to snapshot.")
-                continue
-
-            # --- 2. Determine the precise status of each interface ---
-            TASK_ORDER = {"Data Extraction": 1, "Data Delivery": 2, "Technical Validation": 3, "Functional Validation": 4}
-            tasks_by_interface = {}
-            for task in all_tasks:
-                if task.interface_name not in tasks_by_interface:
-                    tasks_by_interface[task.interface_name] = []
+        interface_file_status_map = {}
+        for upload in all_uploads:
+            if upload.interface_name not in interface_file_status_map:
+                interface_file_status_map[upload.interface_name] = {}
+            interface_file_status_map[upload.interface_name][upload.filename] = upload.status
+        
+        interfaces_with_failures = {
+            name: "Error" in statuses.values() for name, statuses in interface_file_status_map.items()
+        }
+        
+        tasks_by_interface = {name: [] for name in [s.interface_name for s in all_statuses]}
+        for task in all_tasks:
+            if task.interface_name in tasks_by_interface:
                 tasks_by_interface[task.interface_name].append(task)
 
-            counts = {"Completed": 0, "In Progress": 0, "Failed": 0, "Delayed": 0, "Not Started": 0}
-            for s in all_statuses:
-                tasks = tasks_by_interface.get(s.interface_name, [])
-                sorted_tasks = sorted(tasks, key=lambda t: TASK_ORDER.get(t.task_name, 99))
-                
-                all_tasks_completed = all(task.status == 'Concluído' for task in sorted_tasks) and sorted_tasks
-                first_pending_task = next((task for task in sorted_tasks if task.status != 'Concluído'), None)
-
-                status_category = "Not Started" # Default
-                if all_tasks_completed:
-                    status_category = "Completed"
-                elif latest_upload_map.get(s.interface_name) == "Error":
-                    status_category = "Failed"
-                elif first_pending_task and first_pending_task.end_date and first_pending_task.end_date < today:
-                    status_category = "Delayed"
-                elif s.status == InterfaceStatusEnum.in_progress.value or s.status.startswith("Completed"):
-                    status_category = "In Progress"
-                
-                counts[status_category] += 1
-
-            # --- 3. Save the snapshot ---
-            snapshot = db.query(WeeklyProgressSnapshot).filter(
-                WeeklyProgressSnapshot.project_id == project.id,
-                WeeklyProgressSnapshot.week_end_date == last_sunday
-            ).first()
-
-            if snapshot:
-                print("Updating existing snapshot...")
-                snapshot.completed_count = counts["Completed"]
-                snapshot.in_progress_count = counts["In Progress"]
-                snapshot.failed_count = counts["Failed"]
-                snapshot.delayed_count = counts["Delayed"]
-                snapshot.not_started_count = counts["Not Started"]
-                snapshot.total_interfaces = total_interfaces
-            else:
-                print("Creating new snapshot...")
-                snapshot = WeeklyProgressSnapshot(
-                    project_id=project.id,
-                    week_end_date=last_sunday,
-                    completed_count=counts["Completed"],
-                    in_progress_count=counts["In Progress"],
-                    failed_count=counts["Failed"],
-                    delayed_count=counts["Delayed"],
-                    not_started_count=counts["Not Started"],
-                    total_interfaces=total_interfaces
-                )
-                db.add(snapshot)
+        counts = {"Completed": 0, "In Progress": 0, "Failed": 0, "Delayed": 0, "Not Started": 0}
+        
+        for s in all_statuses:
+            tasks = tasks_by_interface.get(s.interface_name, [])
+            has_failed_file = interfaces_with_failures.get(s.interface_name, False)
+            all_tasks_completed = all(t.status == 'Concluído' for t in tasks) and tasks
             
-            db.commit()
-            print(f"Successfully saved snapshot for project {project.project_name}.")
+            first_pending_task = next((t for t in sorted(tasks, key=lambda t: t.id) if t.status != 'Concluído'), None)
+            is_delayed = first_pending_task and first_pending_task.end_date and first_pending_task.end_date < today
 
-    except Exception as e:
-        print(f"An error occurred during the snapshot process: {e}")
-        db.rollback()
-    finally:
-        db.close()
+            if all_tasks_completed:
+                counts["Completed"] += 1
+            elif has_failed_file:
+                counts["Failed"] += 1
+            # Note: We don't count delayed as a primary status for the main counts
+            elif s.status == InterfaceStatusEnum.not_started.value:
+                counts["Not Started"] += 1
+            else:
+                counts["In Progress"] += 1
+            
+            if is_delayed and not all_tasks_completed:
+                counts["Delayed"] += 1 # We count this separately
+
+        # --- END OF HARMONIZED LOGIC ---
+
+        snapshot = WeeklyProgressSnapshot(
+            project_id=project.id,
+            week_end_date=today,
+            completed_count=counts["Completed"],
+            in_progress_count=counts["In Progress"],
+            failed_count=counts["Failed"],
+            delayed_count=counts["Delayed"],
+            not_started_count=counts["Not Started"],
+            total_interfaces=total_interfaces
+        )
+
+        db.merge(snapshot) # Use merge to insert or update if a snapshot for today already exists
+        print(f"Snapshot for {project.project_name} saved.")
+
+    db.commit()
+    db.close()
+    print("Weekly snapshots completed.")
 
 if __name__ == "__main__":
-    print("--- Starting Weekly Progress Snapshot Job ---")
-    take_weekly_snapshots()
-    print("--- Weekly Progress Snapshot Job Finished ---")
+    take_weekly_snapshot()
