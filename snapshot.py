@@ -25,24 +25,27 @@ def take_weekly_snapshot():
     """
     Takes a snapshot of project progress.
     Uses the same harmonized logic as the main application's KPI dashboard.
+    Now explicitly checks for an existing snapshot for the current day
+    and updates it, or creates a new one if none exists.
     """
     db = SessionLocal()
     today = date.today()
 
-    # Logic to only run on Sunday (COMMENTED FOR TESTING!)
-    # This job is intended to run on a specific day, e.g., Sunday (weekday() == 6)
-    # You can adjust this or remove it to run daily.
-    #if today.weekday() != 6:
-    #    print(f"Today is not snapshot day (Sunday). Exiting.")
-    #    db.close()
-    #    return
+    # --- TESTING ---
+    # The check below is commented out to allow the job to run on any day.
+    # Re-enable it for production.
+    # if today.weekday() != 6: # 6 is Sunday
+    #     print(f"Today is not snapshot day (Sunday). Exiting.")
+    #     db.close()
+    #     return
+    # --- END TESTING ---
 
     try:
         projects = db.query(Project).all()
         for project in projects:
             print(f"Processing snapshot for project: '{project.project_name}'...")
             
-            # --- START OF NEW, HARMONIZED LOGIC ---
+            # --- Harmonized logic to calculate current stats ---
             all_statuses = db.query(ProjectInterfaceStatus).filter(
                 ProjectInterfaceStatus.project_id == project.id
             ).all()
@@ -52,12 +55,8 @@ def take_weekly_snapshot():
                 print(f"Project '{project.project_name}' has no interfaces to snapshot. Skipping.")
                 continue
 
-            all_tasks = db.query(ProjectScheduleTask).filter(
-                ProjectScheduleTask.project_id == project.id
-            ).all()
-            all_uploads = db.query(UploadHistory).filter(
-                UploadHistory.project_name == project.project_name
-            ).order_by(UploadHistory.uploaded_at.asc()).all()
+            all_tasks = db.query(ProjectScheduleTask).filter(ProjectScheduleTask.project_id == project.id).all()
+            all_uploads = db.query(UploadHistory).filter(UploadHistory.project_name == project.project_name).order_by(UploadHistory.uploaded_at.asc()).all()
 
             # 1. Check for any validation failures for each interface
             interface_file_status_map = {}
@@ -65,7 +64,7 @@ def take_weekly_snapshot():
                 if upload.interface_name not in interface_file_status_map:
                     interface_file_status_map[upload.interface_name] = {}
                 interface_file_status_map[upload.interface_name][upload.filename] = upload.status
-            
+
             interfaces_with_failures = {
                 name: "Error" in statuses.values() 
                 for name, statuses in interface_file_status_map.items()
@@ -103,21 +102,37 @@ def take_weekly_snapshot():
                 # Separately count if it's delayed (can overlap with other statuses)
                 if is_delayed and not all_tasks_completed:
                     counts["Delayed"] += 1
-            # --- END OF HARMONIZED LOGIC ---
-
+            
             # 3. Create or update the snapshot record
-            snapshot = WeeklyProgressSnapshot(
-                project_id=project.id,
-                week_end_date=today,
-                completed_count=counts["Completed"],
-                in_progress_count=counts["In Progress"],
-                failed_count=counts["Failed"],
-                delayed_count=counts["Delayed"],
-                not_started_count=counts["Not Started"],
-                total_interfaces=total_interfaces
-            )
+            existing_snapshot = db.query(WeeklyProgressSnapshot).filter(
+                WeeklyProgressSnapshot.project_id == project.id,
+                WeeklyProgressSnapshot.week_end_date == today
+            ).first()
 
-            db.merge(snapshot) # Use merge to insert or update if a snapshot for today already exists
+            if existing_snapshot:
+                # If it exists, UPDATE its values.
+                print(f"Updating existing snapshot for '{project.project_name}' on {today}...")
+                existing_snapshot.completed_count = counts["Completed"]
+                existing_snapshot.in_progress_count = counts["In Progress"]
+                existing_snapshot.failed_count = counts["Failed"]
+                existing_snapshot.delayed_count = counts["Delayed"]
+                existing_snapshot.not_started_count = counts["Not Started"]
+                existing_snapshot.total_interfaces = total_interfaces
+            else:
+                # If it does not exist, CREATE a new one.
+                print(f"Creating new snapshot for '{project.project_name}' on {today}...")
+                new_snapshot = WeeklyProgressSnapshot(
+                    project_id=project.id,
+                    week_end_date=today,
+                    completed_count=counts["Completed"],
+                    in_progress_count=counts["In Progress"],
+                    failed_count=counts["Failed"],
+                    delayed_count=counts["Delayed"],
+                    not_started_count=counts["Not Started"],
+                    total_interfaces=total_interfaces
+                )
+                db.add(new_snapshot)
+            
             print(f"Snapshot for '{project.project_name}' saved successfully.")
 
         db.commit()
