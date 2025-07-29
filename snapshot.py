@@ -29,12 +29,13 @@ def take_weekly_snapshot():
     db = SessionLocal()
     today = date.today()
 
+    # Logic to only run on Sunday (COMMENTED FOR TESTING!)
     # This job is intended to run on a specific day, e.g., Sunday (weekday() == 6)
     # You can adjust this or remove it to run daily.
-    if today.weekday() != 6:
-        print(f"Today is not snapshot day (Sunday). Exiting.")
-        db.close()
-        return
+    #if today.weekday() != 6:
+    #    print(f"Today is not snapshot day (Sunday). Exiting.")
+    #    db.close()
+    #    return
 
     try:
         projects = db.query(Project).all()
